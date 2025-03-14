@@ -10,7 +10,11 @@ Param(
     [Parameter(HelpMessage = "A JSON-formatted list of apps to install", Mandatory = $false)]
     [string] $installAppsJson = '[]',
     [Parameter(HelpMessage = "A JSON-formatted list of test apps to install", Mandatory = $false)]
-    [string] $installTestAppsJson = '[]'
+    [string] $installTestAppsJson = '[]',
+    [Parameter(HelpMessage = "RunId of the baseline workflow run", Mandatory = $false)]
+    [string] $baselineWorkflowRunId = '0',
+    [Parameter(HelpMessage = "SHA of the baseline workflow run", Mandatory = $false)]
+    [string] $baselineWorkflowSHA = ''
 )
 
 $containerBaseFolder = $null
@@ -18,7 +22,9 @@ $projectPath = $null
 
 try {
     . (Join-Path -Path $PSScriptRoot -ChildPath "..\AL-Go-Helper.ps1" -Resolve)
+    Import-Module (Join-Path $PSScriptRoot '..\TelemetryHelper.psm1' -Resolve)
     DownloadAndImportBcContainerHelper
+    Import-Module (Join-Path -Path $PSScriptRoot -ChildPath "..\DetermineProjectsToBuild\DetermineProjectsToBuild.psm1" -Resolve) -DisableNameChecking
 
     if ($isWindows) {
         # Pull docker image in the background
@@ -118,6 +124,37 @@ try {
         exit
     }
 
+    $buildArtifactFolder = Join-Path $projectPath ".buildartifacts"
+    New-Item $buildArtifactFolder -ItemType Directory | Out-Null
+
+    $downloadedAppsByType = @()
+    if ($baselineWorkflowSHA -and $baselineWorkflowRunId -ne '0' -and $settings.incrementalBuilds.mode -eq 'modifiedApps') {
+        # Incremental builds are enabled and we are only building modified apps
+        try {
+            $modifiedFiles = Get-ModifiedFiles -baselineSHA $baselineWorkflowSHA
+            OutputMessageAndArray -message "Modified files" -arrayOfStrings $modifiedFiles
+            $buildAll = Get-BuildAllApps -baseFolder $baseFolder -project $project -modifiedFiles $modifiedFiles
+        }
+        catch {
+            OutputNotice -message "Failed to calculate modified files since $baselineWorkflowSHA, building all apps"
+            $buildAll = $true
+        }
+        if (!$buildAll) {
+            Write-Host "Get unmodified apps from baseline workflow run"
+            # Downloaded apps are placed in the build artifacts folder, which is detected by Run-AlPipeline, meaning only non-downloaded apps are built
+            $downloadedAppsByType = Get-UnmodifiedAppsFromBaselineWorkflowRun `
+                -token $token `
+                -settings $settings `
+                -baseFolder $baseFolder `
+                -project $project `
+                -baselineWorkflowRunId $baselineWorkflowRunId `
+                -modifiedFiles $modifiedFiles `
+                -buildArtifactFolder $buildArtifactFolder `
+                -buildMode $buildMode `
+                -projectPath $projectPath
+        }
+    }
+
     if ($bcContainerHelperConfig.ContainsKey('TrustedNuGetFeeds')) {
         Write-Host "Reading TrustedNuGetFeeds"
         foreach($trustedNuGetFeed in $bcContainerHelperConfig.TrustedNuGetFeeds) {
@@ -135,7 +172,8 @@ try {
                     OutputWarning -message "Secret $authTokenSecret needed for trusted NuGetFeeds cannot be found"
                 }
                 else {
-                    $trustedNuGetFeed.Token = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$authTokenSecret"))
+                    $authToken = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$authTokenSecret"))
+                    $trustedNuGetFeed.Token = GetAccessToken -token $authToken -repositories @() -permissions @{"packages"="read";"metadata"="read"}
                 }
             }
         }
@@ -150,11 +188,34 @@ try {
         })
     }
 
-    $installApps = $settings.installApps
-    $installTestApps = $settings.installTestApps
+    $install = @{
+        "Apps" = $settings.installApps + @($installAppsJson | ConvertFrom-Json)
+        "TestApps" = $settings.installTestApps + @($installTestAppsJson | ConvertFrom-Json)
+    }
 
-    $installApps += $installAppsJson | ConvertFrom-Json
-    $installTestApps += $installTestAppsJson | ConvertFrom-Json
+    # Replace secret names in install.apps and install.testApps
+    foreach($list in @('Apps','TestApps')) {
+        $install."$list" = @($install."$list" | ForEach-Object {
+            $pattern = '.*(\$\{\{\s*([^}]+?)\s*\}\}).*'
+            $url = $_
+            if ($url -match $pattern) {
+                $finalUrl = $url.Replace($matches[1],[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$($matches[2])")))
+            }
+            else {
+                $finalUrl = $url
+            }
+            # Check validity of URL
+            if ($finalUrl -like 'http*://*') {
+                try {
+                    Invoke-WebRequest -Method Head -UseBasicParsing -Uri $finalUrl | Out-Null
+                }
+                catch {
+                    throw "Setting: install$($list) contains an inaccessible URL: $($url). Error was: $($_.Exception.Message)"
+                }
+            }
+            return $finalUrl
+        })
+    }
 
     # Analyze app.json version dependencies before launching pipeline
 
@@ -234,9 +295,6 @@ try {
         }
     }
 
-    $buildArtifactFolder = Join-Path $projectPath ".buildartifacts"
-    New-Item $buildArtifactFolder -ItemType Directory | Out-Null
-
     $allTestResults = "testresults*.xml"
     $testResultsFile = Join-Path $projectPath "TestResults.xml"
     $testResultsFiles = Join-Path $projectPath $allTestResults
@@ -255,6 +313,8 @@ try {
         $scriptPath = Join-Path $ALGoFolderName "$ScriptName.ps1"
         if (Test-Path -Path $scriptPath -Type Leaf) {
             Write-Host "Add override for $scriptName"
+            Trace-Information -Message "Using override for $scriptName"
+
             $runAlPipelineParams += @{
                 "$scriptName" = (Get-Command $scriptPath | Select-Object -ExpandProperty ScriptBlock)
             }
@@ -325,9 +385,10 @@ try {
                     $version = [System.Version]$version.SubString(0,$version.Length-4)
                     $publishParams = @{
                         "nuGetServerUrl" = $gitHubPackagesCredential.serverUrl
-                        "nuGetToken" = $gitHubPackagesCredential.token
+                        "nuGetToken" = GetAccessToken -token $gitHubPackagesCredential.token -permissions @{"packages"="read";"contents"="read";"metadata"="read"} -repositories @()
                         "packageName" = $appId
                         "version" = $version
+                        "select" = "LatestMatching"
                     }
                     if ($parameters.ContainsKey('CopyInstalledAppsToFolder')) {
                         $publishParams += @{
@@ -338,6 +399,18 @@ try {
                         Publish-BcNuGetPackageToContainer -containerName $parameters.containerName -tenant $parameters.tenant -skipVerification -appSymbolsFolder $parameters.appSymbolsFolder @publishParams -ErrorAction SilentlyContinue
                     }
                     else {
+                        if ($parameters.ContainsKey('installedApps') -and $parameters.ContainsKey('installedCountry')) {
+                            foreach($installedApp in $parameters.installedApps) {
+                                if ($installedApp.Id -eq $platformAppId) {
+                                    $publishParams += @{
+                                        "installedApps" = $parameters.installedApps
+                                        "installedPlatform" = ([System.Version]$installedApp.Version)
+                                        "installedCountry" = $parameters.installedCountry
+                                    }
+                                    break
+                                }
+                            }
+                        }
                         Download-BcNuGetPackageToFolder -folder $parameters.appSymbolsFolder @publishParams | Out-Null
                     }
                 }
@@ -350,6 +423,7 @@ try {
     "doNotBuildTests",
     "doNotRunTests",
     "doNotRunBcptTests",
+    "doNotRunPageScriptingTests",
     "doNotPublishApps",
     "installTestRunner",
     "installTestFramework",
@@ -364,27 +438,29 @@ try {
         if ($settings."$_") { $runAlPipelineParams += @{ "$_" = $true } }
     }
 
-    switch($buildMode){
-        'Clean' {
-            $preprocessorsymbols = $settings.cleanModePreprocessorSymbols
-
-            if (!$preprocessorsymbols) {
-                throw "No cleanModePreprocessorSymbols defined in settings.json for this project. Please add the preprocessor symbols to use when building in clean mode or disable CLEAN mode."
-            }
-
-            if ($runAlPipelineParams.Keys -notcontains 'preprocessorsymbols') {
-                $runAlPipelineParams["preprocessorsymbols"] = @()
-            }
-
-            Write-Host "Adding Preprocessor symbols: $preprocessorsymbols"
-            $runAlPipelineParams["preprocessorsymbols"] += $preprocessorsymbols
+    if ($buildMode -eq 'Translated') {
+        if ($runAlPipelineParams.Keys -notcontains 'features') {
+            $runAlPipelineParams["features"] = @()
         }
-        'Translated' {
-            if ($runAlPipelineParams.Keys -notcontains 'features') {
-                $runAlPipelineParams["features"] = @()
-            }
-            $runAlPipelineParams["features"] += "translationfile"
-        }
+        Write-Host "Adding translationfile feature"
+        $runAlPipelineParams["features"] += "translationfile"
+    }
+
+    if ($runAlPipelineParams.Keys -notcontains 'preprocessorsymbols') {
+        $runAlPipelineParams["preprocessorsymbols"] = @()
+    }
+
+    # DEPRECATION: REMOVE AFTER April 1st 2025 --->
+    if ($buildMode -eq 'Clean' -and $settings.ContainsKey('cleanModePreprocessorSymbols')) {
+        Write-Host "Adding Preprocessor symbols : $($settings.cleanModePreprocessorSymbols -join ',')"
+        $runAlPipelineParams["preprocessorsymbols"] += $settings.cleanModePreprocessorSymbols
+        Trace-DeprecationWarning -Message "cleanModePreprocessorSymbols is deprecated" -DeprecationTag "cleanModePreprocessorSymbols"
+    }
+    # <--- REMOVE AFTER April 1st 2025
+
+    if ($settings.ContainsKey('preprocessorSymbols')) {
+        Write-Host "Adding Preprocessor symbols : $($settings.preprocessorSymbols -join ',')"
+        $runAlPipelineParams["preprocessorsymbols"] += $settings.preprocessorSymbols
     }
 
     Write-Host "Invoke Run-AlPipeline with buildmode $buildMode"
@@ -402,8 +478,8 @@ try {
         -baseFolder $projectPath `
         -sharedFolder $sharedFolder `
         -licenseFile $licenseFileUrl `
-        -installApps $installApps `
-        -installTestApps $installTestApps `
+        -installApps $install.apps `
+        -installTestApps $install.testApps `
         -installOnlyReferencedApps:$settings.installOnlyReferencedApps `
         -generateDependencyArtifact `
         -updateDependencies:$settings.updateDependencies `
@@ -411,6 +487,8 @@ try {
         -appFolders $settings.appFolders `
         -testFolders $settings.testFolders `
         -bcptTestFolders $settings.bcptTestFolders `
+        -pageScriptingTests $settings.pageScriptingTests `
+        -restoreDatabases $settings.restoreDatabases `
         -buildOutputFile $buildOutputFile `
         -containerEventLogFile $containerEventLogFile `
         -testResultsFile $testResultsFile `
@@ -425,9 +503,33 @@ try {
         -additionalCountries $additionalCountries `
         -obsoleteTagMinAllowedMajorMinor $settings.obsoleteTagMinAllowedMajorMinor `
         -buildArtifactFolder $buildArtifactFolder `
+        -pageScriptingTestResultsFile (Join-Path $buildArtifactFolder 'PageScriptingTestResults.xml') `
+        -pageScriptingTestResultsFolder (Join-Path $buildArtifactFolder 'PageScriptingTestResultDetails') `
         -CreateRuntimePackages:$CreateRuntimePackages `
         -appBuild $appBuild -appRevision $appRevision `
         -uninstallRemovedApps
+
+    # If any apps were downloaded as part of incremental builds in a pr, we should remove them again after the build to prevent them from being included in artifacts
+    if ($ENV:GITHUB_EVENT_NAME -like 'pull_request*' -and $downloadedAppsByType) {
+        $downloadedAppsByType | ForEach-Object {
+            if ($_.downloadedApps) {
+                $mask = $_.mask
+                $thisArtifactFolder = Join-Path $buildArtifactFolder $mask
+                Write-Host "Removing pre-built apps from $thisArtifactFolder"
+                foreach($downloadedApp in $_.downloadedApps) {
+                    $thisApp = Join-Path $thisArtifactFolder $downloadedApp
+                    try {
+                        if (Test-Path $thisApp) {
+                            Remove-Item $thisApp
+                        }
+                        Write-Host "Removed pre-built app: $thisApp"
+                    } catch {
+                        Write-Host "Failed to remove pre-built app: $thisApp"
+                    }
+                }
+            }
+        }
+    }
 
     if ($containerBaseFolder) {
         Write-Host "Copy artifacts and build output back from build container"
