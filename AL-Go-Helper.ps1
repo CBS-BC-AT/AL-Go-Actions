@@ -13,13 +13,15 @@ $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-S
 $ALGoFolderName = '.AL-Go'
 $ALGoSettingsFile = Join-Path '.AL-Go' 'settings.json'
 $RepoSettingsFile = Join-Path '.github' 'AL-Go-Settings.json'
+$CustomTemplateRepoSettingsFile = Join-Path '.github' 'AL-Go-TemplateRepoSettings.doNotEdit.json'
+$CustomTemplateProjectSettingsFile = Join-Path '.github' 'AL-Go-TemplateProjectSettings.doNotEdit.json'
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'defaultCICDPushBranches', Justification = 'False positive.')]
 $defaultCICDPushBranches = @( 'main', 'release/*', 'feature/*' )
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'defaultCICDPullRequestBranches', Justification = 'False positive.')]
 $defaultCICDPullRequestBranches = @( 'main' )
 $runningLocal = $local.IsPresent
 $defaultBcContainerHelperVersion = "latest" # Must be double quotes. Will be replaced by BcContainerHelperVersion if necessary in the deploy step - ex. "https://github.com/organization/navcontainerhelper/archive/refs/heads/branch.zip"
-$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName","GitHubAppClientId")
+$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName","GitHubAppClientId","EnvironmentName")
 
 $runAlPipelineOverrides = @(
     "DockerPull"
@@ -38,6 +40,8 @@ $runAlPipelineOverrides = @(
     "InstallMissingDependencies"
     "PreCompileApp"
     "PostCompileApp"
+    "PipelineInitialize"
+    "PipelineFinalize"
 )
 
 # Well known AppIds
@@ -357,7 +361,7 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
                 $tempName = Join-Path $bcContainerHelperRootFolder ([Guid]::NewGuid().ToString())
                 $bcContainerHelperVersion = "preview"
                 Write-Host "Download failed, downloading BcContainerHelper $bcContainerHelperVersion version from Blob Storage"
-                $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
+                $webclient.DownloadFile("https://bccontainerhelper-addgd5gzaxf9fneh.b02.azurefd.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
             }
         }
         else {
@@ -367,7 +371,7 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
                 $bcContainerHelperVersion = 'preview'
             }
             Write-Host "Downloading BcContainerHelper $bcContainerHelperVersion version from Blob Storage"
-            $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
+            $webclient.DownloadFile("https://bccontainerhelper-addgd5gzaxf9fneh.b02.azurefd.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
         }
         Expand-7zipArchive -Path "$tempName.zip" -DestinationPath $tempName
         $bcContainerHelperPath = (Get-Item -Path (Join-Path $tempName "*\BcContainerHelper.ps1")).FullName
@@ -416,13 +420,19 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
 #
 function DownloadAndImportBcContainerHelper([string] $baseFolder = $ENV:GITHUB_WORKSPACE) {
     $params = @{ "ExportTelemetryFunctions" = $true }
-    $repoSettingsPath = Join-Path $baseFolder $repoSettingsFile
 
     # Default BcContainerHelper Version is hardcoded in AL-Go-Helper (replaced during AL-Go deploy)
     $bcContainerHelperVersion = $defaultBcContainerHelperVersion
+
+    if ("$env:settings" -ne "") {
+        $repoSettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) "$([Guid]::NewGuid().ToString()).json"
+        $env:settings | Set-Content -Path $repoSettingsPath -Encoding UTF8
+    }
+    else {
+        $repoSettingsPath = Join-Path $baseFolder $repoSettingsFile
+    }
     if (Test-Path $repoSettingsPath) {
-        # Read Repository Settings file (without applying organization variables, repository variables or project settings files)
-        # Override default BcContainerHelper version from AL-Go-Helper only if new version is specifically specified in repo settings file
+        # Override default BcContainerHelper version from AL-Go-Helper only if new version is specifically specified in settings
         $repoSettings = Get-Content $repoSettingsPath -Encoding UTF8 | ConvertFrom-Json | ConvertTo-HashTable
         if ($repoSettings.Keys -contains "BcContainerHelperVersion" -and $defaultBcContainerHelperVersion -notlike 'https://*') {
             $bcContainerHelperVersion = $repoSettings.BcContainerHelperVersion
@@ -507,7 +517,7 @@ function MergeCustomObjectIntoOrderedDictionary {
                         if ($srcElmType -eq "PSCustomObject") {
                             # Array of objects are not checked for uniqueness
                             $ht = [ordered]@{}
-                            $srcElm.PSObject.Properties | Sort-Object -Property Name -Culture "iv-iv" | ForEach-Object {
+                            $srcElm.PSObject.Properties | Sort-Object -Property Name -Culture ([cultureinfo]::InvariantCulture) | ForEach-Object {
                                 $ht[$_.Name] = $_.Value
                             }
                             $dst."$prop" += @($ht)
@@ -526,63 +536,12 @@ function MergeCustomObjectIntoOrderedDictionary {
     }
 }
 
-# Read settings from the settings files
-# Settings are read from the following files:
-# - ALGoOrgSettings (github Variable)                 = Organization settings variable
-# - .github/AL-Go-Settings.json                       = Repository Settings file
-# - ALGoRepoSettings (github Variable)                = Repository settings variable
-# - <project>/.AL-Go/settings.json                    = Project settings file
-# - .github/<workflowName>.settings.json              = Workflow settings file
-# - <project>/.AL-Go/<workflowName>.settings.json     = Project workflow settings file
-# - <project>/.AL-Go/<userName>.settings.json         = User settings file
-function ReadSettings {
-    Param(
-        [string] $baseFolder = "$ENV:GITHUB_WORKSPACE",
-        [string] $repoName = "$ENV:GITHUB_REPOSITORY",
-        [string] $project = '.',
-        [string] $buildMode = "Default",
-        [string] $workflowName = "$ENV:GITHUB_WORKFLOW",
-        [string] $userName = "$ENV:GITHUB_ACTOR",
-        [string] $branchName = "$ENV:GITHUB_REF_NAME",
-        [string] $orgSettingsVariableValue = "$ENV:ALGoOrgSettings",
-        [string] $repoSettingsVariableValue = "$ENV:ALGoRepoSettings",
-        [switch] $silent
-    )
-
-    # If the build is triggered by a pull request the refname will be the merge branch. To apply conditional settings we need to use the base branch
-    if (($env:GITHUB_EVENT_NAME -eq "pull_request") -and ($branchName -eq $ENV:GITHUB_REF_NAME)) {
-        $branchName = $env:GITHUB_BASE_REF
-    }
-
-    function GetSettingsObject {
-        Param(
-            [string] $path
-        )
-
-        if (Test-Path $path) {
-            try {
-                if (!$silent.IsPresent) { Write-Host "Applying settings from $path" }
-                $settings = Get-Content $path -Encoding UTF8 | ConvertFrom-Json
-                if ($settings) {
-                    return $settings
-                }
-            }
-            catch {
-                throw "Error reading $path. Error was $($_.Exception.Message).`n$($_.ScriptStackTrace)"
-            }
-        }
-        else {
-            if (!$silent.IsPresent) { Write-Host "No settings found in $path" }
-        }
-        return $null
-    }
-
-    $repoName = $repoName.SubString("$repoName".LastIndexOf('/') + 1)
-    $githubFolder = Join-Path $baseFolder ".github"
-    $workflowName = $workflowName.Trim().Split([System.IO.Path]::getInvalidFileNameChars()) -join ""
-
-    # Start with default settings
-    $settings = [ordered]@{
+function GetDefaultSettings
+(
+    [string] $repoName
+)
+{
+    return [ordered]@{
         "type"                                          = "PTE"
         "unusedALGoSystemFiles"                         = @()
         "projects"                                      = @()
@@ -591,7 +550,7 @@ function ReadSettings {
         "artifact"                                      = ""
         "companyName"                                   = ""
         "repoVersion"                                   = "1.0"
-        "repoName"                                      = $repoName
+        "repoName"                                      = "$repoName"
         "versioningStrategy"                            = 0
         "runNumberOffset"                               = 0
         "appBuild"                                      = 0
@@ -701,6 +660,7 @@ function ReadSettings {
             "defaultReleaseMD"                          = "## Release reference documentation\n\nThis is the generated reference documentation for [{REPOSITORY}](https://github.com/{REPOSITORY}).\n\nYou can use the navigation bar at the top and the table of contents to the left to navigate your documentation.\n\nYou can change this content by creating/editing the **{INDEXTEMPLATERELATIVEPATH}** file in your repository or use the alDoc:defaultReleaseMD setting in your repository settings file (.github/AL-Go-Settings.json)\n\n{RELEASENOTES}"
         }
         "trustMicrosoftNuGetFeeds"                      = $true
+        "nuGetFeedSelectMode"                           = "LatestMatching"
         "commitOptions"                                 = [ordered]@{
             "messageSuffix"                             = ""
             "pullRequestAutoMerge"                      = $false
@@ -716,6 +676,67 @@ function ReadSettings {
         "gitSubmodulesTokenSecretName"                  = "gitSubmodulesToken"
         "shortLivedArtifactsRetentionDays"              = 1  # 0 means use GitHub default
     }
+}
+
+# Read settings from the settings files
+# Settings are read from the following files:
+# - ALGoOrgSettings (github Variable)                    = Organization settings variable
+# - .github/AL-Go-TemplateRepoSettings.doNotEdit.json    = Repository settings from custom template
+# - .github/AL-Go-Settings.json                          = Repository Settings file
+# - ALGoRepoSettings (github Variable)                   = Repository settings variable
+# - .github/AL-Go-TemplateProjectSettings.doNotEdit.json = Project settings from custom template
+# - <project>/.AL-Go/settings.json                       = Project settings file
+# - .github/<workflowName>.settings.json                 = Workflow settings file
+# - <project>/.AL-Go/<workflowName>.settings.json        = Project workflow settings file
+# - <project>/.AL-Go/<userName>.settings.json            = User settings file
+function ReadSettings {
+    Param(
+        [string] $baseFolder = "$ENV:GITHUB_WORKSPACE",
+        [string] $repoName = "$ENV:GITHUB_REPOSITORY",
+        [string] $project = '.',
+        [string] $buildMode = "Default",
+        [string] $workflowName = "$ENV:GITHUB_WORKFLOW",
+        [string] $userName = "$ENV:GITHUB_ACTOR",
+        [string] $branchName = "$ENV:GITHUB_REF_NAME",
+        [string] $orgSettingsVariableValue = "$ENV:ALGoOrgSettings",
+        [string] $repoSettingsVariableValue = "$ENV:ALGoRepoSettings",
+        [switch] $silent
+    )
+
+    # If the build is triggered by a pull request the refname will be the merge branch. To apply conditional settings we need to use the base branch
+    if (($env:GITHUB_EVENT_NAME -eq "pull_request") -and ($branchName -eq $ENV:GITHUB_REF_NAME)) {
+        $branchName = $env:GITHUB_BASE_REF
+    }
+
+    function GetSettingsObject {
+        Param(
+            [string] $path
+        )
+
+        if (Test-Path $path) {
+            try {
+                if (!$silent.IsPresent) { Write-Host "Applying settings from $path" }
+                $settings = Get-Content $path -Encoding UTF8 | ConvertFrom-Json
+                if ($settings) {
+                    return $settings
+                }
+            }
+            catch {
+                throw "Error reading $path. Error was $($_.Exception.Message).`n$($_.ScriptStackTrace)"
+            }
+        }
+        else {
+            if (!$silent.IsPresent) { Write-Host "No settings found in $path" }
+        }
+        return $null
+    }
+
+    $repoName = $repoName.SubString("$repoName".LastIndexOf('/') + 1)
+    $githubFolder = Join-Path $baseFolder ".github"
+    $workflowName = $workflowName.Trim().Split([System.IO.Path]::getInvalidFileNameChars()) -join ""
+
+    # Start with default settings
+    $settings = GetDefaultSettings -repoName $repoName
 
     # Read settings from files and merge them into the settings object
 
@@ -725,20 +746,31 @@ function ReadSettings {
         $orgSettingsVariableObject = $orgSettingsVariableValue | ConvertFrom-Json
         $settingsObjects += @($orgSettingsVariableObject)
     }
+
+    # Read settings from repository settings file
+    $customTemplateRepoSettingsObject = GetSettingsObject -Path (Join-Path $baseFolder $CustomTemplateRepoSettingsFile)
+    $settingsObjects += @($customTemplateRepoSettingsObject)
+
     # Read settings from repository settings file
     $repoSettingsObject = GetSettingsObject -Path (Join-Path $baseFolder $RepoSettingsFile)
     $settingsObjects += @($repoSettingsObject)
+
     # Read settings from repository settings variable (parameter)
     if ($repoSettingsVariableValue) {
         $repoSettingsVariableObject = $repoSettingsVariableValue | ConvertFrom-Json
         $settingsObjects += @($repoSettingsVariableObject)
     }
+
     if ($project) {
+        # Read settings from repository settings file
+        $customTemplateProjectSettingsObject = GetSettingsObject -Path (Join-Path $baseFolder $CustomTemplateProjectSettingsFile)
+        $settingsObjects += @($customTemplateProjectSettingsObject)
         # Read settings from project settings file
         $projectFolder = Join-Path $baseFolder $project -Resolve
         $projectSettingsObject = GetSettingsObject -Path (Join-Path $projectFolder $ALGoSettingsFile)
         $settingsObjects += @($projectSettingsObject)
     }
+
     if ($workflowName) {
         # Read settings from workflow settings file
         $workflowSettingsObject = GetSettingsObject -Path (Join-Path $gitHubFolder "$workflowName.settings.json")
@@ -751,6 +783,7 @@ function ReadSettings {
             $settingsObjects += @($projectWorkflowSettingsObject, $userSettingsObject)
         }
     }
+
     foreach($settingsJson in $settingsObjects) {
         if ($settingsJson) {
             MergeCustomObjectIntoOrderedDictionary -dst $settings -src $settingsJson
@@ -807,6 +840,7 @@ function ReadSettings {
     if ($settings.githubRunnerShell -eq "") {
         $settings.githubRunnerShell = $settings.shell
     }
+
     # Check that gitHubRunnerShell and Shell is valid
     if ($settings.githubRunnerShell -ne "powershell" -and $settings.githubRunnerShell -ne "pwsh") {
         throw "Invalid value for setting: gitHubRunnerShell: $($settings.githubRunnerShell)"
@@ -814,15 +848,58 @@ function ReadSettings {
     if ($settings.shell -ne "powershell" -and $settings.shell -ne "pwsh") {
         throw "Invalid value for setting: shell: $($settings.githubRunnerShell)"
     }
+
     if (($settings.githubRunner -like "*ubuntu-*") -and ($settings.githubRunnerShell -eq "powershell")) {
-        Write-Host "Switching shell to pwsh for ubuntu"
+        if (!$silent.IsPresent) { Write-Host "Switching shell to pwsh for ubuntu" }
         $settings.githubRunnerShell = "pwsh"
     }
 
     if($settings.projectName -eq '') {
         $settings.projectName = $project # Default to project path as project name
     }
+
+    $settings | ValidateSettings
+
     $settings
+}
+
+<#
+    .SYNOPSIS
+        Validate the settings against the settings schema file.
+    .PARAMETER settings
+        The settings to validate.
+#>
+function ValidateSettings {
+    Param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        $settings
+    )
+    Process {
+        $settingsJson = ConvertTo-Json -InputObject $settings -Depth 99 -Compress
+        $settingsSchemaFile = Join-Path $PSScriptRoot "settings.schema.json" -Resolve
+
+        $result = ""
+        try{
+            $command  = [scriptblock] {
+                $result = ''
+                Test-Json -Json $args[0] -SchemaFile $args[1] -ErrorVariable result -ErrorAction SilentlyContinue | Out-Null
+                return $result
+            }
+
+            if($PSVersionTable.PSVersion.Major -lt 6) { # Test-Json is not available in PS5.1
+                $result = pwsh -noprofile -Command $command -args $settingsJson, $settingsSchemaFile
+            }
+            else {
+                $result = Invoke-Command -ScriptBlock $command -ArgumentList $settingsJson, $settingsSchemaFile
+            }
+        }
+        catch {
+            OutputWarning "Error validating settings. Error: $($_.Exception.Message)"
+        }
+        if ($result) {
+            OutputWarning "Settings are not valid. Error: $result"
+        }
+    }
 }
 
 function ExcludeUnneededApps {
@@ -1244,12 +1321,12 @@ function CheckAppDependencyProbingPaths {
                                 foreach($propertyName in "appFolders", "testFolders", "bcptTestFolders") {
                                     Write-Host "Adding folders from $depProject to $propertyName in $project"
                                     $found = $false
-                                    foreach($_ in $depSettings."$propertyName") {
-                                        $folder = Resolve-Path -Path (Join-Path $baseFolder "$depProject/$_") -Relative
-                                        if (!$settings."$propertyName".Contains($folder)) {
-                                            $settings."$propertyName" += @($folder)
+                                    foreach($folder in $depSettings."$propertyName") {
+                                        $relativeFolderPath = Resolve-Path -Path (Join-Path $baseFolder "$depProject/$folder") -Relative
+                                        if (!$settings."$propertyName".Contains($relativeFolderPath)) {
+                                            $settings."$propertyName" += @($relativeFolderPath)
                                             $found = $true
-                                            Write-Host "- $folder"
+                                            Write-Host "- $relativeFolderPath"
                                         }
                                     }
                                     if (!$found) { Write-Host "- No folders added" }
